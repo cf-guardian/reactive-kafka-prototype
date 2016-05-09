@@ -94,13 +94,14 @@ public class ReactiveKafka<K, V> {
         private final Map<TopicPartition, Long> consumedOffsets = new ConcurrentHashMap<>();
         private final long heartbeatIntervalMs;
         private final long commitIntervalMs;
+        private final AtomicBoolean commitPending = new AtomicBoolean();
         private final Mono<KafkaConsumer<K, V>> consumerMono;
         private Cancellation heartbeatCtrl;
         private Cancellation commitCtrl;
         private ReentrantLock consumerLock = new ReentrantLock();
         private AtomicBoolean isRunning = new AtomicBoolean();
 
-        KafkaConsumerAdapter(KafkaConsumerFactory<K, V> consumerFactory,
+        KafkaConsumerAdapter(KafkaConsumerFactory<K, V> consumerFactory, 
                 String groupId, Collection<String> topics,
                 Duration commitInterval, Properties properties) {
             this.heartbeatIntervalMs = consumerFactory.getHeartbeatIntervalMs();
@@ -109,15 +110,17 @@ public class ReactiveKafka<K, V> {
         }
 
         public Flux<ConsumerRecord<K, V>> poll(Duration timeout) {
-
-            restartHeartbeats();
+            stopHeartbeats();
 
             ConsumerRecords<K, V> records = null;
             consumerLock.lock();
             try {
+                if (commitPending.getAndSet(false))
+                    commit(true, true);
                 records = getConsumer().poll(timeout.toMillis());
             } finally {
                 consumerLock.unlock();
+                startHeartbeats();
             }
             if (records == null)
                 return Flux.empty();
@@ -127,19 +130,44 @@ public class ReactiveKafka<K, V> {
 
         @Override
         public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-            commit(true);
+            commit(true, true);
         }
 
         @Override
         public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
         }
 
-        public boolean commit(boolean restartPeriodicCommits) {
+        public boolean commit(boolean restartPeriodicCommits, boolean force) {
             boolean committed = false;
-            if (restartPeriodicCommits)
-                restartPeriodicCommits();
+            if (!consumedOffsets.isEmpty()) {
+                if (restartPeriodicCommits)
+                    stopPeriodicCommits();
+                boolean locked;
+                if (force) {
+                    locked = true;
+                    consumerLock.lock();
+                } else
+                    locked = consumerLock.tryLock();
+                if (locked) {
+                    stopHeartbeats();
+                    try {
+                        committed = commit();
+                    } finally {
+                        consumerLock.unlock();
+                        startHeartbeats();
+                    }
+                } else {
+                    commitPending.set(true);
+                }
+                if (restartPeriodicCommits)
+                    startPeriodicCommits();
+            }
+            return committed;
+        }
+
+        private boolean commit() {
             Map<TopicPartition, OffsetAndMetadata> offsetMap = null;
-            if (!consumedOffsets.isEmpty()) {     
+            if (!consumedOffsets.isEmpty()) {
                 offsetMap = new HashMap<>();
                 Iterator<Map.Entry<TopicPartition, Long>> iterator = consumedOffsets.entrySet().iterator();
                 while (iterator.hasNext()) {
@@ -148,30 +176,25 @@ public class ReactiveKafka<K, V> {
                     iterator.remove();
                 }
             }
-            if (offsetMap != null) {               
-                restartHeartbeats();           
-                consumerLock.lock();
+            if (offsetMap != null)
+                getConsumer().commitSync(offsetMap);
+            return offsetMap != null;
+        }
+
+        public boolean heartbeat() {
+            boolean done = false;
+            KafkaConsumer<K, V> consumer = getConsumer();
+            if (consumerLock.tryLock()) {
                 try {
-                    getConsumer().commitSync(offsetMap);
-                    committed = true;
+                    consumer.pause(consumer.assignment());
+                    consumer.poll(0);
+                    consumer.resume(consumer.assignment());
+                    done = true;
                 } finally {
                     consumerLock.unlock();
                 }
             }
-            return committed;
-        }
-
-        public boolean heartbeat() {
-            KafkaConsumer<K, V> consumer = getConsumer();
-            consumerLock.lock();
-            try {
-                consumer.pause(consumer.assignment());
-                consumer.poll(0);
-                consumer.resume(consumer.assignment());
-            } finally {
-                consumerLock.unlock();
-            }
-            return true;
+            return done;
         }
 
         public CommittableConsumerRecord<K, V> committableConsumerRecord(ConsumerRecord<K, V> consumerRecord) {
@@ -181,12 +204,12 @@ public class ReactiveKafka<K, V> {
         public void onConsumed(ConsumerRecord<K, V> record, boolean commitNow) {
             consumedOffsets.put(new TopicPartition(record.topic(), record.partition()), record.offset());
             if (commitNow)
-                commit(false);
+                commit(false, false);
         }
 
         public void cancel() {
             if (isRunning.getAndSet(false)) {
-                commit(false);
+                commit(false, true);
                 if (heartbeatCtrl != null)
                     heartbeatCtrl.dispose();
                 if (commitCtrl != null)
@@ -195,16 +218,15 @@ public class ReactiveKafka<K, V> {
             }
         }
 
-        private KafkaConsumer<K, V> createConsumer(KafkaConsumerFactory<K, V> consumerFactory,
-                String groupId, Collection<String> topics,
+        private KafkaConsumer<K, V> createConsumer(KafkaConsumerFactory<K, V> consumerFactory, String groupId, Collection<String> topics,
                 Duration commitInterval, Properties properties) {
 
             isRunning.set(true);
             KafkaConsumer<K, V> consumer = consumerFactory.createConsumer(groupId, properties);
             consumer.subscribe(topics);
-            restartHeartbeats();
+            startHeartbeats();
             if (commitInterval != null)
-                restartPeriodicCommits();
+                startPeriodicCommits();
             return consumer;
         }
 
@@ -212,27 +234,32 @@ public class ReactiveKafka<K, V> {
             return consumerMono.get();
         }
 
-        private void restartHeartbeats() {
+        private void stopHeartbeats() {
             if (heartbeatCtrl != null)
                 heartbeatCtrl.dispose();
-            heartbeatCtrl = Flux.interval(heartbeatIntervalMs)
-                                 .map(i -> heartbeat())
-                                 .subscribe();
         }
 
-        private void restartPeriodicCommits() {
+        private void startHeartbeats() {
+            heartbeatCtrl = Flux.interval(heartbeatIntervalMs).map(i -> heartbeat()).subscribe();
+        }
+
+        private void stopPeriodicCommits() {
             if (commitIntervalMs < Long.MAX_VALUE) {
                 if (commitCtrl != null)
                     commitCtrl.dispose();
-                commitCtrl = Flux.interval(commitIntervalMs)
-                                 .map(i -> commit(false))
-                                 .subscribe();
+            }
+        }
+
+        private void startPeriodicCommits() {
+            if (commitIntervalMs < Long.MAX_VALUE) {
+                commitCtrl = Flux.interval(commitIntervalMs).map(i -> commit(false, false)).subscribe();
             }
         }
 
         private class CommittableKafkaConsumerRecord implements CommittableConsumerRecord<K, V> {
 
             private final ConsumerRecord<K, V> consumerRecord;
+
             CommittableKafkaConsumerRecord(ConsumerRecord<K, V> consumerRecord) {
                 this.consumerRecord = consumerRecord;
             }
