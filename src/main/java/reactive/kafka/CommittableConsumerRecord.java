@@ -6,5 +6,5 @@ public interface CommittableConsumerRecord<K, V> {
 
     public ConsumerRecord<K, V> getRecord();
 
-    public void commit();
+    public void commitAsync();
 }

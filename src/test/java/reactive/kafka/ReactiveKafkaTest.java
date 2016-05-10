@@ -23,6 +23,8 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 public final class ReactiveKafkaTest {
+    
+    private static final boolean USE_LOCK_FREE = true;
 
     private ReactiveKafka<String, String> reactiveKafka;
     private String topic = "testtopic";
@@ -33,7 +35,7 @@ public final class ReactiveKafkaTest {
 
     @Before
     public void setUp() {
-        reactiveKafka = new ReactiveKafka<>();
+        reactiveKafka = USE_LOCK_FREE ? new LockFreeReactiveKafka<>() : new ReactiveKafka<>();
     }
 
     @After
@@ -91,7 +93,7 @@ public final class ReactiveKafkaTest {
         incomingFlux.doOnNext(record -> {
                          System.out.println("  Received message: " + record);
                          latch.countDown();
-                         record.commit();
+                         record.commitAsync();
                      })
                     .subscribeOn(Executors.newSingleThreadExecutor())
                     .subscribe();
