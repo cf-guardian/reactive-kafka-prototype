@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <classpath>
+	<classpathentry combineaccessrules="false" kind="src" path="/clients"/>
+	<classpathentry combineaccessrules="false" kind="src" path="/core"/>
+	<classpathentry combineaccessrules="false" kind="src" path="/reactor-core"/>
 	<classpathentry including="**/*.java" kind="src" path="src/main/java"/>
 	<classpathentry including="**/*.java" kind="src" output="target/test-classes" path="src/test/java"/>
 	<classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER/org.eclipse.jdt.internal.debug.ui.launcher.StandardVMType/JavaSE-1.8"/>
@@ -7,6 +10,8 @@
 	<classpathentry kind="var" path="M2_REPO/org/hamcrest/hamcrest-core/1.3/hamcrest-core-1.3.jar"/>
 	<classpathentry kind="var" path="M2_REPO/io/projectreactor/reactor-core/2.5.0.BUILD-SNAPSHOT/reactor-core-2.5.0.BUILD-SNAPSHOT.jar"/>
 	<classpathentry kind="var" path="M2_REPO/org/reactivestreams/reactive-streams/1.0.0/reactive-streams-1.0.0.jar"/>
-	<classpathentry combineaccessrules="false" kind="src" path="/clients"/>
+	<classpathentry kind="lib" path="/Users/rsivaram/.gradle/caches/modules-2/files-2.1/com.101tec/zkclient/0.8/c0f700a4a3b386279d7d8dd164edecbe836cbfdb/zkclient-0.8.jar" sourcepath="/Users/rsivaram/.gradle/caches/modules-2/files-2.1/com.101tec/zkclient/0.8/9e0eb39e2f1bcd483a7fdb8b7affb12fa11209fa/zkclient-0.8-sources.jar"/>
+	<classpathentry sourcepath="/Users/rsivaram/.gradle/caches/modules-2/files-2.1/net.sourceforge.argparse4j/argparse4j/0.5.0/fa8058101fe584a985352c7d6e2125cf9befcf00/argparse4j-0.5.0-sources.jar" kind="lib" path="/Users/rsivaram/.gradle/caches/modules-2/files-2.1/net.sourceforge.argparse4j/argparse4j/0.5.0/701046e9aaaa4a23d45b2d21e3d865426ffb571f/argparse4j-0.5.0.jar"/>
+	<classpathentry combineaccessrules="false" kind="src" path="/spring-kafka-test-010"/>
 	<classpathentry kind="output" path="target/classes"/>
 </classpath>
