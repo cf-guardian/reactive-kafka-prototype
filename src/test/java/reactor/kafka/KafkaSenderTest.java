@@ -11,8 +11,10 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -30,7 +32,7 @@ import reactor.core.util.Exceptions.CancelException;
 import reactor.kafka.internals.KafkaConsumerFactory;
 import reactor.kafka.util.TestUtils;
 
-public class OutboundTest extends AbstractKafkaTest {
+public class KafkaSenderTest extends AbstractKafkaTest {
 
     private KafkaSender<Integer, String> kafkaSender;
     private Consumer<Integer, String> consumer;
@@ -135,6 +137,35 @@ public class OutboundTest extends AbstractKafkaTest {
     }
 
     @Test
+    public void sendCallbackBlockTest() throws Exception {
+        int count = 20;
+        Semaphore blocker = new Semaphore(0);
+        CountDownLatch sendLatch = new CountDownLatch(count);
+        Flux.range(0, count / 2)
+            .flatMap(i -> kafkaSender.send(createProducerRecord(i, true))
+                                     .doOnNext(r -> {
+                                             assertFalse("Running onNext on producer network thread", Thread.currentThread().getName().contains("network"));
+                                             sendLatch.countDown();
+                                             try {
+                                                 blocker.acquire();
+                                             } catch (Exception e) {
+                                                 throw new RuntimeException(e);
+                                             }
+                                         }))
+            .subscribe();
+        Flux.range(count / 2, count / 2)
+            .flatMap(i -> kafkaSender.send(createProducerRecord(i, true))
+                                     .doOnError(e -> e.printStackTrace())
+                                     .doOnNext(r -> sendLatch.countDown()))
+                .subscribe();
+        waitForMessages(consumer, count, false);
+        for (int i = 0; i < count / 2; i++)
+            blocker.release();
+        if (!sendLatch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS))
+            fail(sendLatch.getCount() + " send callbacks not received");
+    }
+
+    @Test
     public void retryTest() throws Exception {
         int count = 4;
         createOutboundErrorFlux(count, false, true)
@@ -180,7 +211,7 @@ public class OutboundTest extends AbstractKafkaTest {
             .flatMap(i -> kafkaSender.send(createProducerRecord(i, true))
                                      .doOnNext(metadata -> {
                                              TestUtils.sleep(100);
-                                             latch.countDown(); 
+                                             latch.countDown();
                                          }),
                      maxConcurrency)
             .subscribe();

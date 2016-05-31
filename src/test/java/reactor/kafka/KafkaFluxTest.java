@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CountDownLatch;
@@ -13,11 +14,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -31,9 +34,10 @@ import org.junit.Test;
 import reactor.core.flow.Cancellation;
 import reactor.core.publisher.Flux;
 import reactor.kafka.KafkaFlux.EventType;
+import reactor.kafka.internals.Utils;
 import reactor.kafka.util.TestUtils;
 
-public class InboundTest extends AbstractKafkaTest {
+public class KafkaFluxTest extends AbstractKafkaTest {
 
     private KafkaSender<Integer, String> kafkaSender;
 
@@ -47,7 +51,7 @@ public class InboundTest extends AbstractKafkaTest {
         super.setUp();
         groupId = testName.getMethodName();
         kafkaSender = new KafkaSender<>(outboundKafkaContext);
-        consumerExecutor = Executors.newCachedThreadPool(TestUtils.newThreadFactory("test-consumer"));
+        consumerExecutor = Executors.newCachedThreadPool(Utils.newThreadFactory("test-consumer"));
     }
 
     @After
@@ -69,24 +73,16 @@ public class InboundTest extends AbstractKafkaTest {
     }
 
     @Test
-    public final void manualCommitTest() throws Exception {
-        Flux<CommittableRecord<Integer, String>> incomingFlux =
-                KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
-                         .doOnPartitionsAssigned(this::onPartitionsAssigned)
-                         .doOnNext(record -> record.commitAsync());
-        consumeAndCheck(incomingFlux, 0, 0, 100, 0, 100);
-    }
-
-    @Test
-    public final void commitCallbackTest() throws Exception {
+    public final void commitAsyncTest() throws Exception {
         int count = 10;
         CountDownLatch commitLatch = new CountDownLatch(count);
         long[] committedOffsets = new long[partitions];
         Flux<CommittableRecord<Integer, String>> incomingFlux =
                 KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
                          .doOnPartitionsAssigned(this::seekToBeginning)
-                         .doOnCommit(offsetMap -> onCommit(offsetMap, commitLatch, committedOffsets))
-                         .doOnNext(record -> record.commitAsync());
+                         .doOnNext(record -> record.commit()
+                                                   .doOnSuccess(i -> onCommit(record, commitLatch, committedOffsets))
+                                                   .subscribe());
 
         subscribe(incomingFlux, new CountDownLatch(count));
         sendMessages(0, count);
@@ -97,24 +93,25 @@ public class InboundTest extends AbstractKafkaTest {
     public final void commitFailureTest() throws Exception {
         int count = 1;
 
-        Semaphore revokeSemaphore = new Semaphore(0);
+        AtomicBoolean commitSuccess = new AtomicBoolean();
         Semaphore commitErrorSemaphore = new Semaphore(0);
         Flux<CommittableRecord<Integer, String>> incomingFlux =
                 KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
                          .doOnPartitionsAssigned(this::seekToBeginning)
-                         .doOnPartitionsRevoked(p -> revokeSemaphore.release())
-                         .doOnCommitError(t -> commitErrorSemaphore.release())
-                         .doOnCommit(offsets -> fail("Unexpected commit success"))
                          .doOnNext(record -> {
-                                 deleteTopic(topic);
-                                 revokeSemaphore.acquireUninterruptibly();
-                                 record.commitAsync();
+                                 Map<TopicPartition, OffsetAndMetadata> offsetMap = new HashMap<>();
+                                 offsetMap.put(new TopicPartition("nonexistent", 0), new OffsetAndMetadata(0));
+                                 record.commit(offsetMap)
+                                       .doOnError(e -> commitErrorSemaphore.release())
+                                       .doOnSuccess(i -> commitSuccess.set(true))
+                                       .subscribe();
                              })
                          .doOnError(e -> e.printStackTrace());
 
         subscribe(incomingFlux, new CountDownLatch(count));
-        sendMessages(0, count);
+        sendMessages(1, count);
         assertTrue("Commit error callback not invoked", commitErrorSemaphore.tryAcquire(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
+        assertFalse("Commit of non existent topic succeeded", commitSuccess.get());
     }
 
     @Test
@@ -127,15 +124,44 @@ public class InboundTest extends AbstractKafkaTest {
         Flux<CommittableRecord<Integer, String>> incomingFlux =
                 KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
                          .doOnPartitionsAssigned(this::onPartitionsAssigned)
-                         .doOnCommit(offsetMap -> onCommit(offsetMap, commitLatch, committedOffsets))
                          .doOnNext(record -> {
                                  assertEquals(committedOffsets[record.consumerRecord().partition()] + 1, record.consumerRecord().offset());
-                                 record.commitSync();
+                                 record.commit()
+                                       .doOnSuccess(i -> onCommit(record, commitLatch, committedOffsets))
+                                       .subscribe()
+                                       .get();
                              })
                          .doOnError(e -> e.printStackTrace());
 
-        subscribe(incomingFlux, new CountDownLatch(count));
-        sendMessages(0, count);
+        sendAndWaitForMessages(incomingFlux, count);
+        checkCommitCallbacks(commitLatch, committedOffsets);
+    }
+
+    @Test
+    public final void commitSyncPeriodicTest() throws Exception {
+        int count = 20;
+        int commitIntervalMessages = 4;
+        CountDownLatch commitLatch = new CountDownLatch(count / commitIntervalMessages);
+        long[] committedOffsets = new long[partitions];
+        for (int i = 0; i < committedOffsets.length; i++)
+            committedOffsets[i] = -1;
+        Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = new HashMap<TopicPartition, OffsetAndMetadata>();
+        Flux<CommittableRecord<Integer, String>> incomingFlux =
+                KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
+                         .doOnPartitionsAssigned(this::onPartitionsAssigned)
+                         .doOnNext(record -> {
+                                 offsetsToCommit.put(new TopicPartition(record.consumerRecord().topic(), record.consumerRecord().partition()),
+                                         new OffsetAndMetadata(record.consumerRecord().offset()));
+                                 if (offsetsToCommit.size() == commitIntervalMessages) {
+                                     record.commit(offsetsToCommit)
+                                           .doOnSuccess(i -> onCommit(offsetsToCommit, commitLatch, committedOffsets))
+                                           .subscribe()
+                                           .get();
+                                 }
+                             })
+                         .doOnError(e -> e.printStackTrace());
+
+        sendAndWaitForMessages(incomingFlux, count);
         checkCommitCallbacks(commitLatch, committedOffsets);
     }
 
@@ -214,7 +240,8 @@ public class InboundTest extends AbstractKafkaTest {
                 KafkaFlux.assign(inboundKafkaContext, "group2", Collections.singletonList(new TopicPartition(topic, 1)))
                          .doOnPartitionsAssigned(this::seekToBeginning)
                          .autoCommit(Duration.ofMillis(50))
-                         .doOnPartitionsAssigned(this::onPartitionsAssigned);
+                         .doOnPartitionsAssigned(this::onPartitionsAssigned)
+                         .doOnError(e -> e.printStackTrace());
         subscribe(partition1Flux, receiveLatch1);
 
         // Receive from partition 0 and send to partition 1
@@ -224,8 +251,10 @@ public class InboundTest extends AbstractKafkaTest {
                      .concatMap(record -> {
                              receiveLatch0.countDown();
                              return kafkaSender.send(new ProducerRecord<Integer, String>(topic, 1, record.consumerRecord().key(), record.consumerRecord().value()))
-                                               .doOnSuccess(sendResult -> {
-                                                       record.commitSync();
+                                               .doOnNext(sendResult -> {
+                                                       record.commit()
+                                                             .subscribe()
+                                                             .get();
                                                        sendLatch1.countDown();
                                                    });
                          })
@@ -238,6 +267,7 @@ public class InboundTest extends AbstractKafkaTest {
         Flux.range(0, count)
             .flatMap(i -> kafkaSender.send(new ProducerRecord<Integer, String>(topic, 0, i, "Message " + i))
                                      .doOnSuccess(metadata -> sendLatch0.countDown()))
+            .doOnError(e -> e.printStackTrace())
             .subscribe();
 
         if (!sendLatch0.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS))
@@ -270,35 +300,20 @@ public class InboundTest extends AbstractKafkaTest {
     @Test
     public final void brokerRestartTest() throws Exception {
         int count = 10;
-        CountDownLatch sendLatch = new CountDownLatch(count);
-        Semaphore revokedSemapore = new Semaphore(0);
-        AtomicInteger received = new AtomicInteger();
         Flux<CommittableRecord<Integer, String>> incomingFlux =
                 KafkaFlux.listenOn(inboundKafkaContext, groupId, Collections.singletonList(topic))
-                         .doOnPartitionsRevoked(p -> revokedSemapore.release())
                          .doOnPartitionsAssigned(this::onPartitionsAssigned)
                          .autoCommit(Duration.ofMillis(50))
-                         .useCapacity(2)
-                         .doOnNext(record -> {
-                                 try {
-                                     if (received.getAndIncrement() == 0) {
-                                         sendLatch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS);
-                                         embeddedKafka.bounce(0);
-                                         TestUtils.sleep(2000);
-                                         embeddedKafka.restart(0);
-                                     }
-                                 } catch (Exception e) {
-                                     throw new RuntimeException(e);
-                                 }
-                             })
                          .doOnError(e -> e.printStackTrace());
 
-        CountDownLatch latch = new CountDownLatch(count);
-        subscribe(incomingFlux, latch);
-        sendMessages(0, count, sendLatch);
-        assertTrue("Revoked callback not invoked during broker restart", revokedSemapore.tryAcquire(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
-        receiveTimeoutMillis += 10000;
-        waitForMessages(latch);
+        CountDownLatch receiveLatch = new CountDownLatch(count);
+        subscribe(incomingFlux, receiveLatch);
+        sendMessagesSync(0, count / 2);
+        embeddedKafka.bounce(0);
+        TestUtils.sleep(2000);
+        embeddedKafka.restart(0);
+        sendMessagesSync(count / 2, count / 2);
+        waitForMessages(receiveLatch);
         checkConsumedMessages();
     }
 
@@ -311,10 +326,7 @@ public class InboundTest extends AbstractKafkaTest {
                              .doOnPartitionsAssigned(this::onPartitionsAssigned)
                              .autoCommit(Duration.ofMillis(50));
 
-            CountDownLatch latch = new CountDownLatch(count);
-            Cancellation cancellation = subscribe(incomingFlux, latch);
-            sendMessages(0, count);
-            assertTrue(latch.getCount() + " messages not received", latch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
+            Cancellation cancellation = sendAndWaitForMessages(incomingFlux, count);
             cancellation.dispose();
             try {
                 testableKafkaFlux.kafkaConsumer().partitionsFor(topic);
@@ -365,8 +377,7 @@ public class InboundTest extends AbstractKafkaTest {
                          .doOnPartitionsAssigned(this::onPartitionsAssigned)
                          .useCapacity(2)
                          .doOnNext(record -> {
-                                 if (receivedCount.getAndIncrement() == 0)
-                                     testableKafkaFlux.events.clear();
+                                 receivedCount.incrementAndGet();
                                  receiveSemaphore.release();
                                  try {
                                      blocker.acquire();
@@ -377,20 +388,29 @@ public class InboundTest extends AbstractKafkaTest {
                          .doOnError(e -> e.printStackTrace());
 
         subscribe(incomingFlux, new CountDownLatch(1));
-        sendMessages(0, count);
+        sendMessagesSync(0, count);
 
         TestUtils.sleep(2000);
         assertTrue("Message not received", receiveSemaphore.tryAcquire(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
         assertEquals(1, receivedCount.get());
+        testableKafkaFlux.events.clear();
+        TestUtils.sleep(2000);
         assertEquals(0, testableKafkaFlux.count(EventType.POLL));
         long endTimeMillis = System.currentTimeMillis() + receiveTimeoutMillis;
+        testableKafkaFlux.events.clear();
         while (receivedCount.get() < count && System.currentTimeMillis() < endTimeMillis) {
             blocker.release();
             assertTrue("Message not received " + receivedCount, receiveSemaphore.tryAcquire(requestTimeoutMillis, TimeUnit.MILLISECONDS));
-            int pollCount = testableKafkaFlux.events.size();
             Thread.sleep(10);
-            assertEquals(pollCount, testableKafkaFlux.events.size());
         }
+    }
+
+    private Cancellation sendAndWaitForMessages(Flux<CommittableRecord<Integer, String>> incomingFlux, int count) throws Exception {
+        CountDownLatch receiveLatch = new CountDownLatch(count);
+        Cancellation cancellation = subscribe(incomingFlux, receiveLatch);
+        sendMessages(0, count);
+        waitForMessages(receiveLatch);
+        return cancellation;
     }
 
     private void waitForMessages(CountDownLatch latch) throws InterruptedException {
@@ -435,12 +455,15 @@ public class InboundTest extends AbstractKafkaTest {
             .subscribe();
     }
 
-    private void sendMessages(int startIndex, int count, CountDownLatch latch) throws Exception {
+    private void sendMessagesSync(int startIndex, int count) throws Exception {
+        CountDownLatch latch = new CountDownLatch(count);
         Flux.range(startIndex, count)
             .map(i -> createProducerRecord(i, true))
             .concatMap(record -> kafkaSender.send(record)
-                                            .doOnSuccess(metadata -> latch.countDown()))
+                                            .doOnSuccess(metadata -> latch.countDown())
+                                            .retry(100))
             .subscribe();
+        assertTrue("Messages not sent ", latch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
     }
 
     private void onPartitionsAssigned(Collection<SeekablePartition> partitions) {
@@ -453,6 +476,11 @@ public class InboundTest extends AbstractKafkaTest {
             partition.seekToBeginning();
         assertEquals(topic, partitions.iterator().next().topicPartition().topic());
         assignSemaphore.release();
+    }
+
+    private void onCommit(CommittableRecord<?, ?> record, CountDownLatch commitLatch, long[] committedOffsets) {
+        committedOffsets[record.consumerRecord().partition()] = record.consumerRecord().offset();
+        commitLatch.countDown();
     }
 
     private void onCommit(Map<TopicPartition, OffsetAndMetadata> offsetMap, CountDownLatch commitLatch, long[] committedOffsets) {
@@ -482,9 +510,11 @@ public class InboundTest extends AbstractKafkaTest {
         }
 
         @Override
-        protected Flux<CommittableRecord<Integer, String>> doEvent(EventType eventType) {
-            events.put(new Date(), eventType);
-            return super.doEvent(eventType);
+        protected void schedule(Event<?> event) {
+            if (event != null) {
+                events.put(new Date(), event.eventType());
+                super.schedule(event);
+            }
         }
 
         int count(EventType event) {

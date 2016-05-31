@@ -42,7 +42,7 @@ public class AbstractKafkaTest {
     protected final List<List<Integer>> receivedMessages = new ArrayList<List<Integer>>(partitions);
 
     public void setUp() throws Exception {
-        System.out.println("********** RUNNING " + testName.getMethodName());
+        System.out.println("********** RUNNING " + getClass().getName() + "." + testName.getMethodName());
         for (int i = 0; i < partitions; i++)
             expectedMessages.add(new ArrayList<>());
         for (int i = 0; i < partitions; i++)
