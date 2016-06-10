@@ -28,6 +28,8 @@ import org.springframework.kafka.test.utils.KafkaTestUtils;
 
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.core.util.Exceptions.CancelException;
 import reactor.kafka.internals.KafkaConsumerFactory;
 import reactor.kafka.util.TestUtils;
@@ -60,7 +62,7 @@ public class KafkaSenderTest extends AbstractKafkaTest {
     public void sendOneTest() {
         int partition = 0;
         Mono<RecordMetadata> sendMono = kafkaSender.send(createProducerRecord(0, true));
-        RecordMetadata metadata = sendMono.get(Duration.ofSeconds(10));
+        RecordMetadata metadata = sendMono.block(Duration.ofSeconds(10));
 
         assertEquals(partition, metadata.partition());
         assertEquals(0, metadata.offset());
@@ -85,7 +87,25 @@ public class KafkaSenderTest extends AbstractKafkaTest {
         CountDownLatch latch = new CountDownLatch(count);
         Flux.range(0, count)
             .flatMap(i -> kafkaSender.send(createProducerRecord(i, true))
-                                     .doOnNext(metadata -> latch.countDown()))
+                                     .doOnNext(metadata -> {
+                                             latch.countDown();
+                                         }))
+            .subscribe();
+
+        assertTrue("Missing callbacks " + latch.getCount(), latch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
+        waitForMessages(consumer, count, true);
+    }
+
+    @Test
+    public void publishManyCallbackTest() throws Exception {
+        int count = 10;
+        CountDownLatch latch = new CountDownLatch(count);
+
+        Flux.range(0, count)
+            .flatMap(i -> kafkaSender.send(createProducerRecord(i, true))
+                                     .doOnNext(metadata -> {
+                                             latch.countDown();
+                                         }))
             .subscribe();
 
         assertTrue("Missing callbacks " + latch.getCount(), latch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
@@ -180,19 +200,19 @@ public class KafkaSenderTest extends AbstractKafkaTest {
     public void concurrentSendTest() throws Exception {
         int count = 1000;
         int fluxCount = 5;
-        ExecutorService executorService = Executors.newCachedThreadPool();
+        Scheduler scheduler = Schedulers.newParallel("send-test");
         CountDownLatch latch = new CountDownLatch(fluxCount + count);
         for (int i = 0; i < fluxCount; i++) {
             Flux.range(0, count)
                 .flatMap(index -> kafkaSender.send(new ProducerRecord<>(topic, 0, "Message " + index))
                                          .doOnNext(metadata -> latch.countDown()))
-                .subscribeOn(executorService)
+                .subscribeOn(scheduler)
                 .subscribe();
         }
 
         assertTrue("Missing callbacks " + latch.getCount(), latch.await(receiveTimeoutMillis, TimeUnit.MILLISECONDS));
         waitForMessages(consumer, count * fluxCount, false);
-        executorService.shutdownNow();
+        scheduler.shutdown();
     }
 
     @Test

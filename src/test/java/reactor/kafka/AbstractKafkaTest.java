@@ -57,6 +57,9 @@ public class AbstractKafkaTest {
         Map<String, Object> props = KafkaTestUtils.consumerProps("", "false", embeddedKafka);
         props.put(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, String.valueOf(sessionTimeoutMillis));
         props.put(ConsumerConfig.HEARTBEAT_INTERVAL_MS_CONFIG, String.valueOf(heartbeatIntervalMillis));
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+        props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "2");
         if (propsOverride != null)
             props.putAll(propsOverride);
         inboundKafkaContext = new KafkaContext<>(props);
@@ -109,6 +112,11 @@ public class AbstractKafkaTest {
     public void deleteTopic(String topic) {
         ZkUtils zkUtils = new ZkUtils(embeddedKafka.getZkClient(), null, false);
         AdminUtils.deleteTopic(zkUtils, topic);
+    }
+
+    public void clearReceivedMessages() {
+        for (List<Integer> list : receivedMessages)
+            list.clear();
     }
 
     protected int count(List<List<Integer>> list) {

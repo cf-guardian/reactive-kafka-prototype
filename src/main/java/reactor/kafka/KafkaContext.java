@@ -13,6 +13,7 @@ public class KafkaContext<K, V> {
     private final KafkaConsumerFactory<K, V> consumerFactory;
 
     private Duration pollTimeout = Duration.ofMillis(10);
+    private Duration closeTimeout = Duration.ofMillis(Long.MAX_VALUE);
 
     public KafkaContext() {
         this(new HashMap<String, Object>());
@@ -29,6 +30,14 @@ public class KafkaContext<K, V> {
 
     public void setPollTimeout(Duration timeout) {
         this.pollTimeout = timeout;
+    }
+
+    public Duration getCloseTimeout() {
+        return closeTimeout;
+    }
+
+    public void setCloseTimeout(Duration timeout) {
+        this.closeTimeout = timeout;
     }
 
     public KafkaConsumerFactory<K, V> getConsumerFactory() {

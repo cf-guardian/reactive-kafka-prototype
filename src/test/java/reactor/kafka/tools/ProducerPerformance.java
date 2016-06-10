@@ -26,6 +26,8 @@ import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
+import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
@@ -34,10 +36,22 @@ import net.sourceforge.argparse4j.inf.Namespace;
 import reactor.core.flow.Cancellation;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.TopicProcessor;
+import reactor.core.scheduler.Schedulers;
+import reactor.core.util.WaitStrategy;
 import reactor.kafka.KafkaContext;
 import reactor.kafka.KafkaSender;
 
 public class ProducerPerformance {
+
+    enum ReactiveMode {
+        FLAT_MAP,
+        TOPIC_PROCESSOR
+    };
+
+    public static ReactiveMode reactiveMode = ReactiveMode.TOPIC_PROCESSOR;
+
+    private static final long DEFAULT_PRODUCER_BUFFER_SIZE = 32 * 1024 * 1024;
 
     public static void main(String[] args) throws Exception {
         ArgumentParser parser = argParser();
@@ -50,20 +64,11 @@ public class ProducerPerformance {
             long numRecords = res.getLong("numRecords");
             int recordSize = res.getInt("recordSize");
             int throughput = res.getInt("throughput");
-            List<String> producerProps = res.getList("producerConfig");
             boolean useReactive = res.getBoolean("reactive");
 
-            Map<String, Object> props = new HashMap<String, Object>();
-            if (producerProps != null)
-                for (String prop : producerProps) {
-                    String[] pieces = prop.split("=");
-                    if (pieces.length != 2)
-                        throw new IllegalArgumentException("Invalid property: " + prop);
-                    props.put(pieces[0], pieces[1]);
-                }
-
-            props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
-            props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
+            Map<String, Object> producerProps = getProperties(res.getList("producerConfig"));
+            producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
+            producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
 
             /* setup perf test */
             byte[] payload = new byte[recordSize];
@@ -78,7 +83,7 @@ public class ProducerPerformance {
                 throw new IllegalArgumentException("Maximum number of records is " + Integer.MAX_VALUE);
 
             if (!useReactive) {
-                KafkaProducer<byte[], byte[]> producer = new KafkaProducer<byte[], byte[]>(props);
+                KafkaProducer<byte[], byte[]> producer = new KafkaProducer<byte[], byte[]>(producerProps);
                 for (int i = 0; i < numRecords; i++) {
                     long sendStartMs = System.currentTimeMillis();
                     Callback cb = stats.nextCompletion(sendStartMs, payload.length, stats);
@@ -88,24 +93,20 @@ public class ProducerPerformance {
                 }
                 producer.close();
             } else {
-                KafkaSender<byte[], byte[]> sender = new KafkaSender<>(new KafkaContext<byte[], byte[]>(props));
-                CountDownLatch latch = new CountDownLatch((int) numRecords);
-                Flux<?> flux = Flux.range(1, (int) numRecords)
-                                   .flatMap(i -> {
-                                           long sendStartMs = System.currentTimeMillis();
-                                           Callback cb = stats.nextCompletion(sendStartMs, payload.length, stats);
-                                           Mono<RecordMetadata> result =  sender.send(record)
-                                                   .doOnError(exception -> cb.onCompletion(null, (Exception) exception))
-                                                   .doOnSuccess(metadata -> {
-                                                           cb.onCompletion(metadata, null);
-                                                           latch.countDown();
-                                                       });
+                KafkaSender<byte[], byte[]> sender = new KafkaSender<>(new KafkaContext<byte[], byte[]>(producerProps));
 
-                                           if (throttler.shouldThrottle(i, sendStartMs))
-                                               throttler.throttle();
-                                           return result;
-                                       })
-                                  .doOnError(e -> e.printStackTrace());
+                String sendBufSizeOverride = (String) producerProps.get(ProducerConfig.SEND_BUFFER_CONFIG);
+                long sendBufSize = sendBufSizeOverride != null ? Long.parseLong(sendBufSizeOverride) : DEFAULT_PRODUCER_BUFFER_SIZE;
+                int payloadSizeLowerPowerOf2 = 1 << (payload.length < 2 ? 0 : 31 - Integer.numberOfLeadingZeros(payload.length - 1));
+                int callbackBufferSize = (int) (sendBufSize / payloadSizeLowerPowerOf2);
+                System.out.println("Running in reactor mode " + reactiveMode + " with callback buffer size " + callbackBufferSize);
+
+                CountDownLatch latch = new CountDownLatch((int) numRecords);
+                Flux<?> flux;
+                if (reactiveMode == ReactiveMode.FLAT_MAP)
+                    flux = createReactiveFlatMapFlux(numRecords, payload, record, sender, stats, throttler, latch, callbackBufferSize);
+                else
+                    flux = createReactiveFlux(numRecords, payload, record, sender, stats, throttler, latch, callbackBufferSize);
                 System.out.println("Running test using reactive API");
                 Cancellation cancellation = flux.subscribe();
                 latch.await();
@@ -124,7 +125,83 @@ public class ProducerPerformance {
                 System.exit(1);
             }
         }
+    }
 
+    private static Flux<RecordMetadata> createReactiveFlatMapFlux(long numRecords, byte[] payload, ProducerRecord<byte[], byte[]> record,
+            KafkaSender<byte[], byte[]> sender, Stats stats,
+            ThroughputThrottler throttler, CountDownLatch latch, int callbackBufferSize) {
+
+        sender.setCallbackScheduler(Schedulers.newComputation("send-callback", 2, callbackBufferSize));
+        Flux<RecordMetadata> flux = Flux.range(1, (int) numRecords)
+                           .flatMap(i -> {
+                                   long sendStartMs = System.currentTimeMillis();
+                                   Callback cb = stats.nextCompletion(sendStartMs, payload.length, stats);
+                                   Mono<RecordMetadata> result =  sender.send(record)
+                                           .doOnError(exception -> cb.onCompletion(null, (Exception) exception))
+                                           .doOnSuccess(metadata -> {
+                                                   cb.onCompletion(metadata, null);
+                                                   latch.countDown();
+                                               });
+
+                                   if (throttler.shouldThrottle(i, sendStartMs))
+                                       throttler.throttle();
+                                   return result;
+                               })
+                          .doOnError(e -> e.printStackTrace());
+        return flux;
+    }
+
+    private static Flux<?> createReactiveFlux(long numRecords, byte[] payload, ProducerRecord<byte[], byte[]> record,
+            KafkaSender<byte[], byte[]> sender, Stats stats,
+            ThroughputThrottler throttler, CountDownLatch latch, int callbackBufferSize) {
+
+        // Since Kafka send callback simply schedules a callback on a topic processor
+        // the mono can be subscribed on the Kafka network thread. The network thread
+        // would be blocked only for executing callbacks, making it consistent with
+        // non-reactive mode.
+        sender.setCallbackScheduler(null);
+
+        final TopicProcessor<Runnable> topicProcessor =
+                TopicProcessor.<Runnable>create("callback-topic-processor", callbackBufferSize, WaitStrategy.parking(), true);
+        topicProcessor.subscribe(new Subscriber<Runnable>() {
+            @Override
+            public void onSubscribe(Subscription s) {
+                s.request(Long.MAX_VALUE);
+            }
+
+            @Override
+            public void onNext(Runnable runnable) {
+                runnable.run();
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                t.printStackTrace();
+            }
+
+            @Override
+            public void onComplete() {
+            }
+        });
+        Flux<?> flux = Flux.range(1, (int) numRecords)
+                           .doOnSubscribe(s -> topicProcessor.subscribe())
+                           .map(i -> {
+                                   long sendStartMs = System.currentTimeMillis();
+                                   Callback cb = stats.nextCompletion(sendStartMs, payload.length, stats);
+                                   Mono<RecordMetadata> mono =  sender.send(record)
+                                           .doOnError(exception -> cb.onCompletion(null, (Exception) exception));
+                                   mono.subscribe(metadata -> {
+                                           topicProcessor.onNext(() -> {
+                                                   cb.onCompletion(metadata, null);
+                                                   latch.countDown();
+                                               });
+                                       });
+                                   if (throttler.shouldThrottle(i, sendStartMs))
+                                       throttler.throttle();
+                                   return i;
+                               })
+                          .doOnError(e -> e.printStackTrace());
+        return flux;
     }
 
     /** Get the command-line argument parser. */
@@ -181,6 +258,19 @@ public class ProducerPerformance {
               .help("if true, use reactive API");
 
         return parser;
+    }
+
+    private static Map<String, Object> getProperties(List<String> propValues) {
+        Map<String, Object> props = new HashMap<String, Object>();
+        if (propValues != null) {
+            for (String prop : propValues) {
+                String[] pieces = prop.split("=");
+                if (pieces.length != 2)
+                    throw new IllegalArgumentException("Invalid property: " + prop);
+                props.put(pieces[0], pieces[1]);
+            }
+        }
+        return props;
     }
 
     private static class Stats {

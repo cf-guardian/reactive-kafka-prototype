@@ -10,8 +10,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -33,15 +31,16 @@ import org.junit.Test;
 
 import reactor.core.flow.Cancellation;
 import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.kafka.KafkaFlux.EventType;
-import reactor.kafka.internals.Utils;
 import reactor.kafka.util.TestUtils;
 
 public class KafkaFluxTest extends AbstractKafkaTest {
 
     private KafkaSender<Integer, String> kafkaSender;
 
-    private ExecutorService consumerExecutor;
+    private Scheduler consumerScheduler;
     private String groupId;
     private Semaphore assignSemaphore = new Semaphore(0);
     private List<Cancellation> subscribeCancellations = new ArrayList<>();
@@ -51,7 +50,7 @@ public class KafkaFluxTest extends AbstractKafkaTest {
         super.setUp();
         groupId = testName.getMethodName();
         kafkaSender = new KafkaSender<>(outboundKafkaContext);
-        consumerExecutor = Executors.newCachedThreadPool(Utils.newThreadFactory("test-consumer"));
+        consumerScheduler = Schedulers.newParallel("test-consumer");
     }
 
     @After
@@ -59,7 +58,15 @@ public class KafkaFluxTest extends AbstractKafkaTest {
         for (Cancellation cancellation : subscribeCancellations)
             cancellation.dispose();
         kafkaSender.close();
-        consumerExecutor.shutdown();
+        consumerScheduler.shutdown();
+    }
+
+    @Test
+    public final void sendReceiveTest() throws Exception {
+        TestableKafkaFlux testableKafkaFlux = TestableKafkaFlux.create(inboundKafkaContext, groupId, Collections.singletonList(topic));
+        Flux<CommittableRecord<Integer, String>> incomingFlux = testableKafkaFlux
+                         .doOnPartitionsAssigned(this::onPartitionsAssigned);
+        consumeAndCheck(incomingFlux, 0, 0, 100, 0, 100);
     }
 
     @Test
@@ -70,6 +77,16 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                          .autoCommit(Duration.ofMillis(50));
         consumeAndCheck(incomingFlux, 0, 0, 100, 0, 100);
         TestUtils.waitUntil("No auto commits", f -> testableKafkaFlux.count(EventType.COMMIT) > 0, testableKafkaFlux, Duration.ofMillis(1000));
+
+        // Close consumer and create another one. First consumer should commit final offset on close.
+        // Second consumer should receive only new messages.
+        for (Cancellation cancellation : subscribeCancellations)
+            cancellation.dispose();
+        clearReceivedMessages();
+        Flux<CommittableRecord<Integer, String>> incomingFlux2 = TestableKafkaFlux.create(inboundKafkaContext, groupId, Collections.singletonList(topic))
+                         .doOnPartitionsAssigned(this::onPartitionsAssigned)
+                         .autoCommit(Duration.ofMillis(50));
+        consumeAndCheck(incomingFlux2, 0, 100, 100, 100, 100);
     }
 
     @Test
@@ -129,7 +146,7 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                                  record.commit()
                                        .doOnSuccess(i -> onCommit(record, commitLatch, committedOffsets))
                                        .subscribe()
-                                       .get();
+                                       .block();
                              })
                          .doOnError(e -> e.printStackTrace());
 
@@ -156,7 +173,7 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                                      record.commit(offsetsToCommit)
                                            .doOnSuccess(i -> onCommit(offsetsToCommit, commitLatch, committedOffsets))
                                            .subscribe()
-                                           .get();
+                                           .block();
                                  }
                              })
                          .doOnError(e -> e.printStackTrace());
@@ -254,12 +271,12 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                                                .doOnNext(sendResult -> {
                                                        record.commit()
                                                              .subscribe()
-                                                             .get();
+                                                             .block();
                                                        sendLatch1.countDown();
                                                    });
                          })
                      .doOnError(e -> e.printStackTrace())
-                     .subscribeOn(consumerExecutor)
+                     .subscribeOn(consumerScheduler)
                      .subscribe();
         subscribeCancellations.add(cancellation0);
 
@@ -324,7 +341,7 @@ public class KafkaFluxTest extends AbstractKafkaTest {
             TestableKafkaFlux testableKafkaFlux = TestableKafkaFlux.create(inboundKafkaContext, groupId, Collections.singletonList(topic));
             Flux<CommittableRecord<Integer, String>> incomingFlux = testableKafkaFlux
                              .doOnPartitionsAssigned(this::onPartitionsAssigned)
-                             .autoCommit(Duration.ofMillis(50));
+                             .autoCommit(Duration.ofMillis(1000));
 
             Cancellation cancellation = sendAndWaitForMessages(incomingFlux, count);
             cancellation.dispose();
@@ -357,7 +374,7 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                                  latch.countDown();
                              })
                          .doOnError(e -> e.printStackTrace())
-                         .subscribeOn(consumerExecutor);
+                         .subscribeOn(consumerScheduler);
             subscribeCancellations.add(incomingFlux[i].subscribe());
             assignSemaphore.acquire();
         }
@@ -441,10 +458,10 @@ public class KafkaFluxTest extends AbstractKafkaTest {
                                 latch.countDown();
                             })
                         .doOnError(e -> e.printStackTrace())
-                        .subscribeOn(consumerExecutor)
+                        .subscribeOn(consumerScheduler)
                         .subscribe();
         subscribeCancellations.add(cancellation);
-        assertTrue("Partitions not assigned", assignSemaphore.tryAcquire(requestTimeoutMillis, TimeUnit.MILLISECONDS));
+        assertTrue("Partitions not assigned", assignSemaphore.tryAcquire(sessionTimeoutMillis + 1000, TimeUnit.MILLISECONDS));
         return cancellation;
     }
 
@@ -510,10 +527,10 @@ public class KafkaFluxTest extends AbstractKafkaTest {
         }
 
         @Override
-        protected void schedule(Event<?> event) {
+        protected void doEvent(Event<?> event) {
             if (event != null) {
                 events.put(new Date(), event.eventType());
-                super.schedule(event);
+                super.doEvent(event);
             }
         }
 

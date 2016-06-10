@@ -9,8 +9,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,14 +32,19 @@ import reactor.core.flow.Cancellation;
 import reactor.core.publisher.EmitterProcessor;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.core.subscriber.SubmissionEmitter;
-import reactor.kafka.internals.Utils;
+import reactor.core.subscriber.SubmissionEmitter.Emission;
 
 public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements ConsumerRebalanceListener {
 
     private static final Logger log = LoggerFactory.getLogger(KafkaFlux.class.getName());
 
     private final Duration pollTimeout;
+    private final Duration closeTimeout;
+    private final EmitterProcessor<Event<?>> eventEmitter;
+    private final SubmissionEmitter<Event<?>> eventSubmission;
     private final EmitterProcessor<ConsumerRecords<K, V>> recordEmitter;
     private final SubmissionEmitter<ConsumerRecords<K, V>> recordSubmission;
     private KafkaConsumer<K, V> consumer;
@@ -55,12 +59,11 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
     private final List<Consumer<Collection<SeekablePartition>>> revokeListeners = new ArrayList<>();
     private final AtomicLong requestsPending = new AtomicLong();
     private final AtomicBoolean needsHeartbeat = new AtomicBoolean();
-    private final ExecutorService eventExecutor = Executors.newSingleThreadExecutor(Utils.newThreadFactory("reactor-events"));
-    private final ExecutorService recordExecutor = Executors.newSingleThreadExecutor(Utils.newThreadFactory("reactor-records"));
+    private final Scheduler eventScheduler;
     private final AtomicBoolean isRunning = new AtomicBoolean();
 
     enum EventType {
-        INIT, POLL, HEARTBEAT, COMMIT
+        INIT, POLL, HEARTBEAT, COMMIT, CLOSE
     }
 
     public static <K, V> KafkaFlux<K, V> listenOn(KafkaContext<K, V> context, String groupId, Collection<String> topics) {
@@ -84,6 +87,11 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
     public KafkaFlux(KafkaContext<K, V> context, Consumer<KafkaFlux<K, V>> kafkaSubscribeOrAssign, String groupId) {
         log.debug("Created Kafka flux", groupId);
         this.pollTimeout = context.getPollTimeout();
+        this.closeTimeout = context.getCloseTimeout();
+        this.eventScheduler = Schedulers.newSingle("reactive-kafka-" + groupId);
+        eventScheduler.start();
+        eventEmitter = EmitterProcessor.create();
+        eventSubmission = eventEmitter.connectEmitter();
         recordEmitter = EmitterProcessor.create();
         recordSubmission = recordEmitter.connectEmitter();
 
@@ -97,6 +105,7 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
                      .doOnSubscribe(i -> needsHeartbeat.set(true))
                      .map(i -> heartbeatEvent);
 
+        fluxList.add(eventEmitter);
         fluxList.add(initFlux);
         fluxList.add(heartbeatFlux);
     }
@@ -151,15 +160,14 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
             throw new IllegalStateException("Already subscribed.");
 
         eventFlux = Flux.merge(fluxList)
-                        .doOnNext(event -> schedule(event));
+                        .publishOn(eventScheduler);
 
-        consumerFlux = 
-            Flux.from(recordEmitter)
-                .publishOn(recordExecutor) // TODO: publish on the same executor/scheduler as this flux
+        consumerFlux = recordEmitter
+                .publishOn(Schedulers.parallel())
                 .doOnSubscribe(s -> {
                         try {
                             isRunning.set(true);
-                            cancellations.add(eventFlux.subscribe());
+                            cancellations.add(eventFlux.subscribe(event -> doEvent(event)));
                         } catch (Exception e) {
                             log.error("Subscription to event flux failed", e);
                             throw e;
@@ -177,7 +185,7 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
                 })
             .doOnRequest(r -> {
                     if (requestsPending.addAndGet(r) > 0)
-                         schedule(pollEvent);
+                         emit(pollEvent);
                 })
             .subscribe(subscriber);
     }
@@ -185,37 +193,38 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
     private void cancel() {
         log.debug("cancel {}", isRunning);
         if (isRunning.getAndSet(false)) {
+            boolean isConsumerClosed = false;
             try {
+                consumer.wakeup();
                 if (autoCommitOffsets != null && !autoCommitOffsets.isEmpty())
-                    schedule(autoCommitEvent());
-                eventExecutor.shutdown();
-                eventExecutor.awaitTermination(pollTimeout.toMillis(), TimeUnit.MILLISECONDS);
-                eventExecutor.shutdownNow();
+                    emit(autoCommitEvent());
+                CloseEvent closeEvent = new CloseEvent();
+                emit(closeEvent);
+                isConsumerClosed = closeEvent.await(closeTimeout);
+                eventScheduler.shutdown();
             } catch (InterruptedException e) {
                 // ignore
             }
-            if (!eventExecutor.isShutdown()) {
-                consumer.wakeup();
-                eventExecutor.shutdownNow();
-                try {
-                    // in case consumer was not in poll at the time of wakeup
-                    consumer.poll(0);
-                } catch (WakeupException e) {
-                    // ignore
-                }
-            }
             for (Cancellation cancellation : cancellations)
                 cancellation.dispose();
-            consumer.close();
-            recordExecutor.shutdownNow();
+            if (!isConsumerClosed)
+                consumer.close();
         }
     }
 
-    protected void schedule(Event<?> event) {
-        log.trace("schedule {}", event.eventType);
-        if (isRunning.get()) {
-            eventExecutor.submit(event);
+    protected void doEvent(Event<?> event) {
+        log.trace("doEvent {}", event.eventType);
+        try {
+            event.run();
+        } catch (Exception e) {
+            onException(e);
         }
+    }
+
+    private void emit(Event<?> event) {
+        Emission emission = eventSubmission.emit(event);
+        if (emission != Emission.OK)
+            log.error("Event emission failed", emission);
     }
 
     protected KafkaConsumer<K, V> kafkaConsumer() {
@@ -233,7 +242,7 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
         Iterator<Map.Entry<TopicPartition, Long>> iterator = autoCommitOffsets.entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<TopicPartition, Long> entry = iterator.next();
-            offsetMap.put(entry.getKey(), new OffsetAndMetadata(entry.getValue()));
+            offsetMap.put(entry.getKey(), new OffsetAndMetadata(entry.getValue() + 1));
             iterator.remove();
         }
         return new CommitEvent(offsetMap, null, e -> onException(e));
@@ -298,12 +307,14 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
                     ConsumerRecords<K, V> records = consumer.poll(pollTimeout.toMillis());
                     if (records.count() > 0)
                         recordSubmission.emit(records);
-                    if (requestsPending.addAndGet(0 - records.count()) > 0)
-                        schedule(this);
+                    if (requestsPending.addAndGet(0 - records.count()) > 0 && isRunning.get())
+                        emit(this);
                 }
             } catch (Exception e) {
-                log.error("Unexpected exception", e);
-                onException(e);
+                if (isRunning.get()) {
+                    log.error("Unexpected exception", e);
+                    onException(e);
+                }
             }
         }
     }
@@ -319,7 +330,7 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
         @Override
         public void run() {
             try {
-                if (isRunning.get() && !commitOffsets.isEmpty()) {
+                if (!commitOffsets.isEmpty()) {
                     consumer.commitAsync(commitOffsets, (offsets, exception) -> {
                             if (exception == null) {
                                 if (responseConsumer != null)
@@ -354,6 +365,32 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
         }
     }
 
+    private class CloseEvent extends Event<ConsumerRecords<K, V>> {
+        private Semaphore semaphore = new Semaphore(0);
+        CloseEvent() {
+            super(EventType.CLOSE, null, null);
+        }
+        @Override
+        public void run() {
+            try {
+                if (consumer != null) {
+                    try {
+                        consumer.poll(0);
+                    } catch (WakeupException e) {
+                        // ignore
+                    }
+                    consumer.close();
+                }
+                semaphore.release();
+            } catch (Exception e) {
+                log.error("Unexpected exception", e);
+                onException(e);
+            }
+        }
+        boolean await(Duration timeout) throws InterruptedException {
+            return semaphore.tryAcquire(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        }
+    }
 
     private class CommittableKafkaConsumerRecord implements CommittableRecord<K, V> {
 
@@ -371,13 +408,13 @@ public class KafkaFlux<K, V> extends Flux<CommittableRecord<K, V>> implements Co
         @Override
         public Mono<Void> commit() {
             Map<TopicPartition, OffsetAndMetadata> offsets = new HashMap<>();
-            offsets.put(new TopicPartition(consumerRecord.topic(), consumerRecord.partition()), new OffsetAndMetadata(consumerRecord.offset()));
+            offsets.put(new TopicPartition(consumerRecord.topic(), consumerRecord.partition()), new OffsetAndMetadata(consumerRecord.offset() + 1));
             return commit(offsets);
         }
 
         @Override
         public Mono<Void> commit(Map<TopicPartition, OffsetAndMetadata> offsets) {
-            return Mono.create(emitter -> schedule(new CommitEvent(offsets,
+            return Mono.create(emitter -> emit(new CommitEvent(offsets,
                     response -> emitter.complete(),
                     exception -> emitter.fail(exception))));
         }
